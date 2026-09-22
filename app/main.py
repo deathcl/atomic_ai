@@ -7,7 +7,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import sse
@@ -24,17 +24,32 @@ from .schemas import (
 from .session import (
     SessionState,
     SessionStore,
+    SqliteSessionStore,
     extract_tool_outputs,
     hash_chain,
     is_new_turn,
     is_valid_resume,
     new_session_id,
 )
+from .params import GenerationParams
+from .runtime import resolve_runtime
 from .upstream import UpstreamClient, UpstreamError
 
 app = FastAPI(title="Atomic Decomposition Proxy")
 
-session_store = SessionStore(ttl_seconds=settings.session_ttl_seconds, max_sessions=settings.max_sessions)
+def _build_session_store() -> SessionStore:
+    """Store de sesiones según SESSION_BACKEND: memoria (por defecto) o
+    SQLite persistente (sobrevive a reinicios, compartible entre workers)."""
+    if settings.session_backend == "sqlite":
+        return SqliteSessionStore(
+            ttl_seconds=settings.session_ttl_seconds,
+            max_sessions=settings.max_sessions,
+            database_path=settings.session_database_path,
+        )
+    return SessionStore(ttl_seconds=settings.session_ttl_seconds, max_sessions=settings.max_sessions)
+
+
+session_store = _build_session_store()
 
 
 def _flatten_messages(messages: list[ChatMessage]) -> str:
@@ -136,7 +151,12 @@ class PreparedRun:
     turn_history: list[str] = field(default_factory=list)
 
 
-async def _resolve_run(request: ChatCompletionRequest, client: UpstreamClient, requested_model: str) -> PreparedRun:
+async def _resolve_run(
+    request: ChatCompletionRequest,
+    client: UpstreamClient,
+    requested_model: str,
+    profile: Optional[str] = None,
+) -> PreparedRun:
     """Resuelve una request en una de tres vías: (1) reanudación de una fase
     pausada por tool call, sin redecomponer ni reejecutar nada ya resuelto;
     (2) turno nuevo sobre una conversación con sesión viva ya completada, que
@@ -145,12 +165,19 @@ async def _resolve_run(request: ChatCompletionRequest, client: UpstreamClient, r
     (primera vez, o TTL expirado) — fallback correcto por sí mismo gracias a
     _extract_goal_context, solo más caro."""
     messages = _serialize_messages(request)
+    config = resolve_runtime(requested_model, profile=profile)
+    params = GenerationParams.from_request(request)
     session = await session_store.find_matching(messages)
 
     if session and is_valid_resume(session, messages):
         tool_outputs = extract_tool_outputs(session, messages)
         engine = AtomicDecompositionEngine(
-            client, session.model, tools=session.tools, tool_choice=session.tool_choice
+            client,
+            session.model,
+            tools=session.tools,
+            tool_choice=session.tool_choice,
+            config=config,
+            params=params,
         )
         engine.goal_ctx = session.goal_ctx
         engine.root = session.root
@@ -180,7 +207,12 @@ async def _resolve_run(request: ChatCompletionRequest, client: UpstreamClient, r
             request.messages, prior_context_override="\n\n".join(session.turn_history)
         )
         engine = AtomicDecompositionEngine(
-            client, requested_model, tools=request.tools, tool_choice=request.tool_choice
+            client,
+            requested_model,
+            tools=request.tools,
+            tool_choice=request.tool_choice,
+            config=config,
+            params=params,
         )
         engine.goal_ctx = goal_ctx
         events = engine.run()
@@ -199,7 +231,12 @@ async def _resolve_run(request: ChatCompletionRequest, client: UpstreamClient, r
 
     goal_ctx = _extract_goal_context(request.messages)
     engine = AtomicDecompositionEngine(
-        client, requested_model, tools=request.tools, tool_choice=request.tool_choice
+        client,
+        requested_model,
+        tools=request.tools,
+        tool_choice=request.tool_choice,
+        config=config,
+        params=params,
     )
     engine.goal_ctx = goal_ctx
     events = engine.run()
@@ -261,12 +298,33 @@ async def list_models() -> dict:
     }
 
 
+def _metrics_headers(response: Response, prepared: PreparedRun, *, finished: bool) -> None:
+    """Headers de observabilidad: request-id y perfil siempre; duración y
+    coste estimado cuando el run ya terminó (respuesta no-streaming)."""
+    if not settings.expose_metrics:
+        return
+    metrics = prepared.engine.metrics
+    response.headers["X-Atomic-Request-Id"] = metrics.request_id
+    response.headers["X-Atomic-Profile"] = metrics.profile
+    if not finished:
+        return
+    response.headers["X-Atomic-Duration-Ms"] = str(round(metrics.total_duration() * 1000))
+    cost = estimate_cost(prepared.engine.config.model_prices, metrics.usage_by_model)
+    if cost is not None:
+        response.headers["X-Atomic-Cost-Usd"] = str(cost)
+
+
 @app.post("/v1/chat/completions")
-async def chat_completions(request: ChatCompletionRequest):
+async def chat_completions(
+    request: ChatCompletionRequest,
+    response: Response,
+    x_atomic_profile: Optional[str] = Header(default=None, alias="X-Atomic-Profile"),
+):
     requested_model = request.model or settings.upstream_model
     client = UpstreamClient()
-    prepared = await _resolve_run(request, client, requested_model)
+    prepared = await _resolve_run(request, client, requested_model, profile=x_atomic_profile)
     lock = prepared.resumed_session.lock if prepared.resumed_session else None
+    _metrics_headers(response, prepared, finished=False)
 
     if request.stream:
         return StreamingResponse(
@@ -283,7 +341,7 @@ async def chat_completions(request: ChatCompletionRequest):
         try:
             async for kind, payload in prepared.events:
                 if kind == "reasoning":
-                    if settings.expose_reasoning_content:
+                    if settings.effective_trace_mode() != "off":
                         reasoning_parts.append(payload)
                 elif kind == "content":
                     content_parts.append(payload)
@@ -307,7 +365,9 @@ async def chat_completions(request: ChatCompletionRequest):
             Choice(
                 message=ResponseMessage(
                     content=final_content if content_parts else None,
-                    reasoning_content=("".join(reasoning_parts) if settings.expose_reasoning_content else None),
+                    reasoning_content=(
+                        "".join(reasoning_parts) if settings.effective_trace_mode() != "off" else None
+                    ),
                     tool_calls=tool_calls,
                 ),
                 finish_reason="tool_calls" if tool_calls else "stop",
@@ -329,7 +389,7 @@ async def _stream_response(prepared: PreparedRun, lock: Optional[asyncio.Lock]):
         try:
             async for kind, payload in prepared.events:
                 if kind == "reasoning":
-                    if settings.expose_reasoning_content:
+                    if settings.effective_trace_mode() != "off":
                         yield sse.reasoning_chunk(model, payload, chunk_id)
                 elif kind == "content":
                     content_parts.append(payload)

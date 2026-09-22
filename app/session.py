@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import sqlite3
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Literal, Optional
 
 from .engine import GoalContext, TaskNode
@@ -59,6 +61,53 @@ class SessionState:
     @property
     def pending_tool_call_ids(self) -> set[str]:
         return {tc["id"] for tc in self.pending_tool_calls if tc.get("id")}
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialización completa (sin el lock) para persistir la sesión."""
+        return {
+            "session_id": self.session_id,
+            "checkpoint_hash": self.checkpoint_hash,
+            "checkpoint_len": self.checkpoint_len,
+            "goal_ctx": self.goal_ctx.to_dict(),
+            "model": self.model,
+            "tools": self.tools,
+            "tool_choice": self.tool_choice,
+            "root": self.root.to_dict(),
+            "leaves": [leaf.to_dict() for leaf in self.leaves],
+            "results": list(self.results),
+            "pending_phase": self.pending_phase,
+            "pending_leaf_index": self.pending_leaf_index,
+            "pending_tool_calls": self.pending_tool_calls,
+            "pending_conversation": self.pending_conversation,
+            "tool_round_count": self.tool_round_count,
+            "turn_history": list(self.turn_history),
+            "last_used_at": self.last_used_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "SessionState":
+        from .engine import TaskNode
+
+        state = cls(
+            session_id=str(data.get("session_id") or ""),
+            checkpoint_hash=str(data.get("checkpoint_hash") or ""),
+            checkpoint_len=int(data.get("checkpoint_len") or 0),
+            goal_ctx=GoalContext.from_dict(data.get("goal_ctx")),
+            model=str(data.get("model") or ""),
+            tools=data.get("tools"),
+            tool_choice=data.get("tool_choice"),
+            root=TaskNode.from_dict(root_data),
+            leaves=[TaskNode.from_dict(leaf) for leaf in (data.get("leaves") or [])],
+            results=[str(r) for r in (data.get("results") or [])],
+            pending_phase=data.get("pending_phase"),
+            pending_leaf_index=data.get("pending_leaf_index"),
+            pending_tool_calls=list(data.get("pending_tool_calls") or []),
+            pending_conversation=list(data.get("pending_conversation") or []),
+            tool_round_count=int(data.get("tool_round_count") or 0),
+            turn_history=[str(t) for t in (data.get("turn_history") or [])],
+            last_used_at=float(data.get("last_used_at") or time.time()),
+        )
+        return state
 
 
 def is_valid_resume(session: SessionState, messages: list[dict[str, Any]]) -> bool:
@@ -141,3 +190,57 @@ class SessionStore:
         expired = [sid for sid, s in self._sessions.items() if s.last_used_at < cutoff]
         for sid in expired:
             self._sessions.pop(sid, None)
+
+
+class SqliteSessionStore(SessionStore):
+    """SessionStore persistente en SQLite: sobrevive a reinicios del proceso
+    y permite compartir sesiones entre workers. El índice en memoria se
+    mantiene como caché de lectura; la escritura es siempre doble (memoria +
+    disco)."""
+
+    def __init__(self, ttl_seconds: float, max_sessions: int, database_path: str) -> None:
+        super().__init__(ttl_seconds=ttl_seconds, max_sessions=max_sessions)
+        self._database_path = database_path
+        parent = Path(database_path).parent
+        if str(parent):
+            parent.mkdir(parents=True, exist_ok=True)
+        self._connection = sqlite3.connect(database_path, check_same_thread=False)
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sessions (
+                session_id TEXT PRIMARY KEY,
+                checkpoint_len INTEGER NOT NULL,
+                last_used_at REAL NOT NULL,
+                payload TEXT NOT NULL
+            )
+            """
+        )
+        self._connection.commit()
+        self._load_all()
+
+    def _load_all(self) -> None:
+        cursor = self._connection.execute(
+            "SELECT payload FROM sessions ORDER BY last_used_at DESC"
+        )
+        for (payload,) in cursor.fetchall():
+            try:
+                state = SessionState.from_dict(json.loads(payload))
+            except Exception:  # pragma: no cover - fila corrupta: se ignora
+                continue
+            self._sessions[state.session_id] = state
+
+    async def save(self, session: SessionState) -> None:
+        await super().save(session)
+        payload = json.dumps(session.to_dict(), ensure_ascii=False, default=str)
+        self._connection.execute(
+            """
+            INSERT INTO sessions (session_id, checkpoint_len, last_used_at, payload)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(session_id) DO UPDATE SET
+                checkpoint_len = excluded.checkpoint_len,
+                last_used_at = excluded.last_used_at,
+                payload = excluded.payload
+            """,
+            (session.session_id, session.checkpoint_len, session.last_used_at, payload),
+        )
+        self._connection.commit()
