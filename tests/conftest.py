@@ -8,7 +8,7 @@ import httpx
 import pytest
 import respx
 
-from app.config import settings
+from app.config import Settings, settings
 
 
 class FakeUpstream:
@@ -113,6 +113,23 @@ def _fake_upstream_url(monkeypatch: pytest.MonkeyPatch) -> None:
     ficticio que solo respx conoce, sin importar qué backend tenga configurado
     el desarrollador localmente."""
     monkeypatch.setattr(settings, "upstream_base_url", "http://fake-upstream.test")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Restaura todos los settings a los defaults del código en cada test.
+
+    El .env local puede activar flags de rendimiento (ATOMIC_FAST_PATH,
+    MULTIMODAL_FORWARDING=smart, TRACE_MODE, SESSION_BACKEND, ...) que cambian
+    exactamente el comportamiento que la suite verifica; con este fixture la
+    suite es hermética ante cualquier .env del desarrollador. No toca
+    upstream_base_url, que fija _fake_upstream_url a un host ficticio.
+    """
+    defaults = Settings(_env_file=None)
+    for name in Settings.model_fields:
+        if name == "upstream_base_url":
+            continue
+        monkeypatch.setattr(settings, name, getattr(defaults, name))
 
 
 @pytest.fixture

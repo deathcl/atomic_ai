@@ -65,3 +65,23 @@ def test_pending_leaf_but_missing_tool_output_is_not_valid_resume():
     messages = [{"role": "user"}, {"role": "user"}, {"role": "user", "content": "otra cosa"}]
     assert is_valid_resume(session, messages) is False
     assert is_new_turn(session, messages) is False  # sigue pendiente, no es "turno nuevo"
+
+
+def test_session_state_roundtrip_serialization():
+    """to_dict -> from_dict restaura el árbol completo.
+
+    Regresión: `from_dict` referenciaba una variable inexistente (`root_data`)
+    y lanzaba NameError; SqliteSessionStore._load_all la tragaba, así que con
+    SESSION_BACKEND=sqlite las sesiones nunca se restauraban tras un reinicio.
+    """
+    leaf = TaskNode(description="hoja", depth=1, is_atomic=True, result="ok")
+    root = TaskNode(description="raíz", depth=0, children=[leaf])
+    session = _base_session(root=root, leaves=[leaf], results=["ok"], turn_history=["respuesta previa"])
+
+    restored = SessionState.from_dict(session.to_dict())
+
+    assert restored.root.to_dict() == root.to_dict()
+    assert restored.leaves[0].result == "ok"
+    assert restored.results == ["ok"]
+    assert restored.turn_history == ["respuesta previa"]
+    assert restored.goal_ctx.turn_instruction == "haz algo"

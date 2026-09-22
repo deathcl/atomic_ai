@@ -96,7 +96,7 @@ class SessionState:
             model=str(data.get("model") or ""),
             tools=data.get("tools"),
             tool_choice=data.get("tool_choice"),
-            root=TaskNode.from_dict(root_data),
+            root=TaskNode.from_dict(data.get("root") or {}),
             leaves=[TaskNode.from_dict(leaf) for leaf in (data.get("leaves") or [])],
             results=[str(r) for r in (data.get("results") or [])],
             pending_phase=data.get("pending_phase"),
