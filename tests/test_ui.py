@@ -1,4 +1,4 @@
-"""Tests de la UI (docs/UI_IMPLEMENTACION.md — Pasos 1 y 2: catálogo y schemas)."""
+"""Tests de la UI (docs/UI_IMPLEMENTACION.md — Pasos 1–3: catálogo, schemas y envfile)."""
 import json
 from typing import Literal, get_args, get_origin
 
@@ -7,7 +7,7 @@ from pydantic import ValidationError
 from pydantic.fields import FieldInfo
 
 from app.config import Settings
-from app.web import catalog
+from app.web import catalog, envfile
 from app.web.schemas import ConfigUpdate, env_updates
 
 
@@ -118,3 +118,100 @@ def test_env_updates_formats_for_envfile():
     assert json.loads(updates["MODEL_PRICES"]) == {"m": {"input": 1.0}}
     # no enviado → no aparece (no se toca esa clave del .env)
     assert "PLANNER_MODEL" not in updates
+
+
+# --- Paso 3: envfile (escritura segura del .env) -----------------------------
+
+_SAMPLE = """# --- Upstream ---
+UPSTREAM_BASE_URL=https://api.example.com
+UPSTREAM_MODEL=model-x
+
+# --- Observabilidad ---
+EXPOSE_METRICS=true
+"""
+
+
+def _env(tmp_path, text: str = _SAMPLE):
+    p = tmp_path / ".env"
+    p.write_text(text, encoding="utf-8")
+    return p
+
+
+def test_read_env_parses_and_preserves_order(tmp_path):
+    p = _env(tmp_path, _SAMPLE + 'MODEL_PRICES={"m": {"input": 1}}\n')
+    data = envfile.read_env(p)
+    assert list(data)[:2] == ["UPSTREAM_BASE_URL", "UPSTREAM_MODEL"]
+    assert json.loads(data["MODEL_PRICES"]) == {"m": {"input": 1}}
+
+
+def test_write_env_updates_only_sent_keys(tmp_path):
+    p = _env(tmp_path)
+    envfile.write_env(p, {"UPSTREAM_MODEL": "otro"})
+    text = p.read_text(encoding="utf-8")
+    assert "UPSTREAM_MODEL=otro" in text
+    # el resto del fichero queda intacto (líneas y comentarios)
+    assert "UPSTREAM_BASE_URL=https://api.example.com" in text
+    assert "# --- Observabilidad ---" in text
+    # backup con el contenido ORIGINAL
+    backups = list(tmp_path.glob(".env.bak-*"))
+    assert len(backups) == 1
+    assert "UPSTREAM_MODEL=model-x" in backups[0].read_text(encoding="utf-8")
+
+
+def test_write_env_missing_key_goes_to_its_group(tmp_path):
+    p = _env(tmp_path)
+    # LOG_LEVEL (grupo «Proxy», ausente) y clave existente en su sitio
+    envfile.write_env(p, {"LOG_LEVEL": "WARNING", "EXPOSE_METRICS": "false"})
+    lines = p.read_text(encoding="utf-8").splitlines()
+    i_group = lines.index("# --- Proxy ---")
+    assert lines[i_group + 1] == "LOG_LEVEL=WARNING"
+    assert "EXPOSE_METRICS=false" in lines
+
+
+def test_write_env_quotes_and_writes_atomically(tmp_path):
+    p = _env(tmp_path)
+    envfile.write_env(p, {"MODEL_PRICES": '{"m": {"input": 1}}'})
+    line = [l for l in p.read_text(encoding="utf-8").splitlines()
+            if l.startswith("MODEL_PRICES=")][0]
+    assert line.startswith('MODEL_PRICES="')  # entrecomillado por los espacios
+    # round-trip: lo que lee Settings es exactamente lo que se mandó
+    assert json.loads(envfile.read_env(p)["MODEL_PRICES"]) == {"m": {"input": 1}}
+    assert not list(tmp_path.glob("*.tmp"))  # sin temporales colgados
+
+
+def test_write_env_backup_failure_aborts_write(tmp_path, monkeypatch):
+    p = _env(tmp_path)
+
+    def boom(self, *args, **kwargs):
+        raise OSError("disco lleno")
+
+    monkeypatch.setattr(envfile.Path, "write_bytes", boom)
+    with pytest.raises(RuntimeError):
+        envfile.write_env(p, {"UPSTREAM_MODEL": "nuevo"})
+    # el .env original queda intacto
+    assert "UPSTREAM_MODEL=model-x" in p.read_text(encoding="utf-8")
+
+
+def test_backup_rotation_keeps_ten(tmp_path):
+    p = _env(tmp_path)
+    for i in range(13):
+        (tmp_path / f".env.bak-20260101-{i:06d}").write_text("old", encoding="utf-8")
+    envfile.write_env(p, {"UPSTREAM_MODEL": "y"})
+    backups = sorted(x.name for x in tmp_path.glob(".env.bak-*"))
+    assert len(backups) == envfile.BACKUP_KEEP == 10
+    assert ".env.bak-20260101-000000" not in backups  # los más antiguos rotaron
+
+
+def test_reset_fields_writes_defaults_and_clears_none(tmp_path):
+    p = _env(tmp_path, _SAMPLE + "EXPOSE_REASONING_CONTENT=true\n")
+    envfile.reset_fields(
+        p, ["LOG_LEVEL", "ATOMIC_FAST_PATH", "EXPOSE_REASONING_CONTENT"]
+    )
+    data = envfile.read_env(p)
+    assert data["LOG_LEVEL"] == "INFO"           # default de Settings
+    assert data["ATOMIC_FAST_PATH"] == "false"
+    # default None = «sin definir» → la línea se borra
+    assert "EXPOSE_REASONING_CONTENT" not in data
+    with pytest.raises(KeyError):
+        envfile.reset_fields(p, ["NO_EXISTE"])
+

@@ -420,11 +420,11 @@ Cada punto de Fase 2 sigue las mismas reglas: catálogo único, widgets generado
 
 > **Si este documento quedó a medias, esta sección es tu punto de reanudación.** Marca lo que esté hecho; todo lo no marcado es lo siguiente. Regla de oro: **nada nuevo sin `pytest` en verde** y **nada de la UI escrito a mano que deba salir del catálogo**.
 
-**Estado actual al escribir este documento: NADA implementado (solo este plan).** Índice de progreso = Pasos 1–9 de §7 + Fase 2.
+**Estado actual al escribir este documento: pasos 1–3 implementados y en verde (55/55 tests). Índice de progreso = Pasos 1–9 de §7 + Fase 2.
 
-- [ ] **Paso 1** — `app/web/catalog.py` existe; `PARAMS` cubre exactamente `Settings.model_fields`; test `test_catalog_matches_settings` en verde.
-- [ ] **Paso 2** — `app/web/schemas.py` genera `ConfigUpdate` desde el catálogo; test de `Literal`/límites en verde.
-- [ ] **Paso 3** — `app/web/envfile.py`: backup atómico + reescritura selectiva; tests `test_put_writes_env_and_reloads` y `test_put_invalid_keeps_env_intact` en verde.
+- [x] **Paso 1** — `app/web/catalog.py` existe; `PARAMS` cubre exactamente `Settings.model_fields`; test `test_catalog_matches_settings` en verde.
+- [x] **Paso 2** — `app/web/schemas.py` genera `ConfigUpdate` desde el catálogo; test `test_config_update_*` (Literal, límites, patrones, secrets, modelo precios) en verde.
+- [x] **Paso 3** — `app/web/envfile.py`: backup atómico + reescritura selectiva; tests `test_read_env_*`, `test_write_env_*` y `test_reset_fields_*` en verde.
 - [ ] **Paso 4** — `app/web/routes.py` con los 9 endpoints de §6 montados en `main.py`; `PUT` recarga en caliente y revierte ante config inválida.
 - [ ] **Paso 5** — `static/index.html` + `app.js` + `styles.css`; **verificación manual**: abrir `/ui/`, cambiar `ATOMIC_PROFILE` en el desplegable y comprobar que no existe ningún campo de texto libre donde el catálogo dice `select`/`toggle`/`slider`.
 - [ ] **Paso 6** — SSE compartido extraído a `app/streaming.py`; `/v1/chat/completions` sigue pasando sus tests (nada roto).
