@@ -32,8 +32,14 @@ from .session import (
     new_session_id,
 )
 from .params import GenerationParams
+from .observability import setup_logging
 from .runtime import resolve_runtime
 from .upstream import UpstreamClient, UpstreamError
+
+# Logging estructurado (JSON en stderr) configurado una sola vez al importar la
+# app: sin esto, LOG_LEVEL no tenía efecto y los eventos (upstream_retry, etc.)
+# se perdían por no existir handler.
+setup_logging(settings.log_level)
 
 app = FastAPI(title="Atomic Decomposition Proxy")
 
