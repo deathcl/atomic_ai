@@ -1,10 +1,14 @@
-"""Tests de la UI (docs/UI_IMPLEMENTACION.md — Paso 1: catálogo único)."""
+"""Tests de la UI (docs/UI_IMPLEMENTACION.md — Pasos 1 y 2: catálogo y schemas)."""
+import json
 from typing import Literal, get_args, get_origin
 
+import pytest
+from pydantic import ValidationError
 from pydantic.fields import FieldInfo
 
 from app.config import Settings
 from app.web import catalog
+from app.web.schemas import ConfigUpdate, env_updates
 
 
 def _resolved_default(fi: FieldInfo):
@@ -67,3 +71,50 @@ def test_secrets_and_json_widget():
     }
     prices = next(s for s in catalog.PARAMS if s.field == "model_prices")
     assert prices.widget == "json"
+
+
+# --- Paso 2: ConfigUpdate generado del catálogo -----------------------------
+
+def test_config_update_enforces_catalog_rules():
+    """select cerrado, cotas, campos opcionales de fase y extra=forbid (§5.2)."""
+    # opción fuera del select inmutable
+    with pytest.raises(ValidationError):
+        ConfigUpdate(trace_mode="verbose")
+    # fuera de cotas
+    with pytest.raises(ValidationError):
+        ConfigUpdate(max_subtasks_per_node=999)
+    # campo desconocido (typo) → 422, no se ignora en silencio
+    with pytest.raises(ValidationError):
+        ConfigUpdate(nope=1)
+    # campo de fase opcional: vacío = usar fallback (§5.1)
+    assert ConfigUpdate(planner_model="").planner_model == ""
+    # la URL base NO es opcional: vacío → 422
+    with pytest.raises(ValidationError):
+        ConfigUpdate(upstream_base_url="")
+
+
+def test_config_update_model_prices():
+    ok = ConfigUpdate(model_prices={"deepseek-v4-flash": {"input": 0.5, "output": 2.0}})
+    assert ok.model_prices is not None
+    # clave desconocida dentro del precio (§5.3 ejemplo) → 422
+    with pytest.raises(ValidationError):
+        ConfigUpdate(model_prices={"m": {"entrada": 1}})
+
+
+def test_env_updates_formats_for_envfile():
+    """Conversión validada → pares .env (Paso 3 los consumirá)."""
+    updates = env_updates(
+        ConfigUpdate(
+            trace_mode="off",
+            expose_metrics=False,
+            planner_temperature=0.2,
+            model_prices={"m": {"input": 1}},
+        )
+    )
+    assert updates["TRACE_MODE"] == "off"
+    assert updates["EXPOSE_METRICS"] == "false"
+    assert updates["PLANNER_TEMPERATURE"] == "0.2"
+    # JSON compacto, sin nulos, re-parseable por Settings
+    assert json.loads(updates["MODEL_PRICES"]) == {"m": {"input": 1.0}}
+    # no enviado → no aparece (no se toca esa clave del .env)
+    assert "PLANNER_MODEL" not in updates

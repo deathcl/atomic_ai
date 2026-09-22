@@ -241,6 +241,8 @@ ConfigUpdate = build_config_model()
 
 Si mañana añades un parámetro a `catalog.py`, aparece automáticamente en el formulario **y** en la validación del servidor: no hay dos sitios que mantener.
 
+> **Nota de implementación (Paso 2):** los patrones del catálogo se aplican con `re.match` de Python en un `model_validator(mode="after")` (`_pattern_validator`), **no** con `StringConstraints(pattern=...)`: pydantic v2 valida `pattern` con el motor Rust `regex`, que no soporta `\Z` ni lookaround (`PATH_RE` usa `(?!\.\.)`) y fallaría con `SchemaError`. Misma semántica, mismo patrón, un solo origen (el catálogo).
+
 ### 5.3 `MODEL_PRICES` (JSON)
 
 ```python
