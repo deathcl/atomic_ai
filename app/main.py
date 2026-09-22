@@ -32,7 +32,7 @@ from .session import (
     new_session_id,
 )
 from .params import GenerationParams
-from .observability import setup_logging
+from .observability import estimate_cost, setup_logging
 from .runtime import resolve_runtime
 from .upstream import UpstreamClient, UpstreamError
 
