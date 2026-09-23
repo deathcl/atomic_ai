@@ -285,6 +285,21 @@ Ejemplo válido: `{"deepseek-v4-flash": {"input": 0.5, "output": 2.0}}`. Inváli
 
 **Seguridad transversal:** todas las rutas de `PUT/DELETE/POST` exigen header `X-UI-Token` si `settings.ui_token` está definido (`401` si falta o no coincide, comparación con `secrets.compare_digest`). `UI_TOKEN` está catalogado (widget `password`, secret, `KEY_RE`): vacío = desactivado, aceptable porque el proxy escucha en `127.0.0.1` por defecto.
 
+**Formato del stream del playground.** El JS lo lee con `fetch` + `ReadableStream` (no `EventSource`: ese solo hace `GET` y este endpoint es `POST`). Cada evento va etiquetado y su `data` es, salvo en `metrics`/`error`, exactamente el chunk OpenAI-compatible que produce `app/sse.py`:
+
+| evento | `data` |
+|--------|--------|
+| `chunk` | chunk OpenAI-compatible (rol, `finish_reason`) — mismo formato que `/v1/chat/completions` |
+| `reasoning` | chunk con `delta.reasoning_content` (se omite con `TRACE_MODE=off`) |
+| `content` | chunk con `delta.content` |
+| `tool_calls` | chunk con `delta.tool_calls`, seguido del cierre `finish_reason="tool_calls"` |
+| `metrics` | `RunMetrics.to_dict()` del run (llamadas, tokens, coste, límites alcanzados) |
+| `error` | `{"message", "type"}` si el upstream falla a mitad |
+| `done` | `[DONE]` |
+
+El playground **no persiste sesión** (no llama a `_persist_session`) ni alimenta el dashboard (`registry.record` solo se llama desde `/v1/chat/completions`): es un banco de pruebas y no debe contaminar el estado de los clientes reales.
+
+
 
 ## 7. Fase 1 — implementación paso a paso
 
@@ -366,6 +381,22 @@ def require_token(x_ui_token: Header(default="")) -> None:
 
 `POST /playground` **reutiliza, no duplica**: importa `_resolve_run` y el formateo SSE de `app/main.py` (extraerlos a `app/streaming.py` compartido si hace falta — Paso 6). Aplica el perfil del body (`fast|balanced|quality`, select inmutable) con `apply_profile` antes de crear el motor.
 
+**Implementado (estado real, v1.1.1).** Además de `app/web/routes.py` con los 9 endpoints:
+
+* `app/web/registry.py` — `RunRegistry` en memoria (agregados + últimas 50 ejecuciones). `app/main.py` lo alimenta con `_record_run(prepared)` en las tres salidas del run (no streaming, stream con `tool_calls`, stream normal). El histórico persistente es Fase 2.
+* `app/session.py` — `SessionStore.snapshot()` y `SessionStore.delete()` (con override en `SqliteSessionStore`, que borra también de disco) para `/ui/api/sessions`.
+* `app/main.py` — `app.include_router(ui_router)` y la ruta `ENV_PATH` vive en el módulo de rutas, no en `Settings`.
+* El perfil del playground lo aplica `_resolve_run(..., profile=body.profile)` (que ya llama a `resolve_runtime`), no se duplica la lógica de `profiles.py`.
+
+Decisiones de implementación que no estaban escritas arriba y conviene no volver a discutir:
+
+1. **`routes.ENV_PATH`** (module-level, `Path(".env")`) es el fichero que edita la UI. Los tests lo apuntan a `tmp_path` con `monkeypatch`, así la suite nunca toca el `.env` real del desarrollador.
+2. **`reload_settings(env_file=".env")`** acepta la ruta a recargar (la UI pasa `str(ENV_PATH)`); `Settings(_env_file=…)`. El rollback usa `envfile.restore(path, texto_previo)`, y `envfile.write_env` ahora **devuelve la ruta del backup** que creó (o `None` si no había fichero).
+3. **Secrets**: un valor vacío o la máscara (`••••1234` / `(no definida)`) **no** se reescribe (§5.1). Para borrar un secreto se usa `/config/reset`, que sí escribe el default del catálogo.
+4. **`GET /stats/stream`** emite `event: stats` con tick acotado (0.25–60 s, default 2 s) y el generador se expone como `routes.stats_events(interval)` para poder testearlo sin HTTP.
+5. El panel estático (`/ui/`) y la redirección de `/` siguen siendo el Paso 6.
+
+
 ### Paso 5 — `app/web/static/` (frontend sin build)
 
 ```
@@ -433,17 +464,18 @@ Cada punto de Fase 2 sigue las mismas reglas: catálogo único, widgets generado
 
 > **Si este documento quedó a medias, esta sección es tu punto de reanudación.** Marca lo que esté hecho; todo lo no marcado es lo siguiente. Regla de oro: **nada nuevo sin `pytest` en verde** y **nada de la UI escrito a mano que deba salir del catálogo**.
 
-**Estado actual: pasos 1–3 implementados y en verde (56/56 tests), más `UI_TOKEN` (Paso 7) ya presente en `Settings`, en el catálogo y en el `.env.example`; del Paso 7 solo falta el test, que depende del Paso 4.** Índice de progreso = Pasos 1–9 de §7 + Fase 2.
+**Estado actual: pasos 1–4 y 7 implementados y en verde (69/69 tests); los 10 tests del Paso 8 ya existen en `tests/test_ui.py`. Falta el frontend (Pasos 5–6) y la documentación final (Paso 9).** Índice de progreso = Pasos 1–9 de §7 + Fase 2.
 
 - [x] **Paso 1** — `app/web/catalog.py` existe; `PARAMS` cubre exactamente `Settings.model_fields`; test `test_catalog_matches_settings` en verde.
 - [x] **Paso 2** — `app/web/schemas.py` genera `ConfigUpdate` desde el catálogo; test `test_config_update_*` (Literal, límites, patrones, secrets, modelo precios) en verde.
 - [x] **Paso 3** — `app/web/envfile.py`: backup atómico + reescritura selectiva; tests `test_read_env_*`, `test_write_env_*` y `test_reset_fields_*` en verde.
-- [ ] **Paso 4** — `app/web/routes.py` con los 9 endpoints de §6 montados en `main.py`; `PUT` recarga en caliente y revierte ante config inválida.
+- [x] **Paso 4** — `app/web/routes.py` con los 9 endpoints de §6 montados en `main.py`; `PUT` recarga en caliente y revierte ante config inválida. Incluye `app/web/registry.py` (dashboard) y `snapshot()`/`delete()` en el store de sesiones.
 - [ ] **Paso 5** — `static/index.html` + `app.js` + `styles.css`; **verificación manual**: abrir `/ui/`, cambiar `ATOMIC_PROFILE` en el desplegable y comprobar que no existe ningún campo de texto libre donde el catálogo dice `select`/`toggle`/`slider`.
-- [ ] **Paso 6** — SSE compartido extraído a `app/streaming.py`; `/v1/chat/completions` sigue pasando sus tests (nada roto).
-- [ ] **Paso 7** — `UI_TOKEN` en `Settings` + catálogo + `.env.example` (**hecho**); falta `test_token_required_when_set`, que se escribe con el Paso 4 (es el que exige el header).
-- [ ] **Paso 8** — los 10 tests de la tabla en verde (`tests/test_ui.py`).
-- [ ] **Paso 9** — README, `GUIA_DEL_PROXY.md` y `.env.example` actualizados.
+- [ ] **Paso 6** — montar el estático en `/ui/` (la API ya está montada desde el Paso 4) + redirección de `/` y SSE compartido si hace falta extraerlo a `app/streaming.py`; `/v1/chat/completions` sigue pasando sus tests (nada roto).
+- [x] **Paso 7** — `UI_TOKEN` en `Settings` + catálogo + `.env.example`; `test_token_required_when_set` en verde (se escribe con el Paso 4, que es quien exige el header).
+- [x] **Paso 8** — los 10 tests de la tabla en verde en `tests/test_ui.py` (los nombres pueden variar: `test_config_update_enforces_catalog_rules`, `test_put_config_writes_env_reloads_and_backs_up`, `test_put_invalid_value_leaves_env_byte_identical`, `test_get_config_groups_every_param_and_masks_secrets`, `test_config_update_model_prices`, `test_token_required_when_set`, `test_playground_streams_real_engine_events`, `test_sessions_endpoints`, `test_stats_endpoint_aggregates_registry`, `test_stats_stream_emits_named_event`).
+- [ ] **Paso 9** — README y `GUIA_DEL_PROXY.md` actualizados (el `.env.example` ya tiene `UI_TOKEN` desde el Paso 7).
+
 - [ ] **Fase 2** — §8, uno a uno (sesiones → perfil → test de conexión → log → histórico).
 
 **How to resume (primeros 5 minutos):**

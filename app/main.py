@@ -35,6 +35,8 @@ from .params import GenerationParams
 from .observability import estimate_cost, setup_logging
 from .runtime import resolve_runtime
 from .upstream import UpstreamClient, UpstreamError
+from .web.registry import registry as run_registry
+from .web.routes import router as ui_router
 
 # Logging estructurado (JSON en stderr) configurado una sola vez al importar la
 # app: sin esto, LOG_LEVEL no tenía efecto y los eventos (upstream_retry, etc.)
@@ -42,6 +44,10 @@ from .upstream import UpstreamClient, UpstreamError
 setup_logging(settings.log_level)
 
 app = FastAPI(title="Atomic Decomposition Proxy")
+
+# API de la administración (docs/UI_IMPLEMENTACION.md §6). El panel estático
+# (/ui/) se monta en el Paso 6; la API va aquí para poder testearse ya.
+app.include_router(ui_router)
 
 def _build_session_store() -> SessionStore:
     """Store de sesiones según SESSION_BACKEND: memoria (por defecto) o
@@ -304,6 +310,16 @@ async def list_models() -> dict:
     }
 
 
+def _record_run(prepared: PreparedRun) -> None:
+    """Publica el resumen de un run terminado en el registro del dashboard.
+
+    Es la única línea que necesita el proxy para alimentar la UI: el motor ya
+    calcula ``RunMetrics`` para sus propias cabeceras, aquí solo se acumula
+    una copia en memoria (``app/web/registry.py``).
+    """
+    run_registry.record(prepared.engine.metrics.to_dict(prepared.engine.config.model_prices))
+
+
 def _metrics_headers(response: Response, prepared: PreparedRun, *, finished: bool) -> None:
     """Headers de observabilidad: request-id y perfil siempre; duración y
     coste estimado cuando el run ya terminó (respuesta no-streaming)."""
@@ -361,6 +377,7 @@ async def chat_completions(
 
         final_content = "".join(content_parts)
         await _persist_session(prepared, paused=bool(tool_calls), final_content=final_content)
+        _record_run(prepared)
     finally:
         if lock:
             lock.release()
@@ -402,6 +419,7 @@ async def _stream_response(prepared: PreparedRun, lock: Optional[asyncio.Lock]):
                     yield sse.content_chunk(model, payload, chunk_id)
                 elif kind == "tool_calls":
                     await _persist_session(prepared, paused=True, final_content="".join(content_parts))
+                    _record_run(prepared)
                     yield sse.raw_delta_chunk(model, {"tool_calls": payload}, chunk_id)
                     yield sse.final_chunk(model, chunk_id, finish_reason="tool_calls")
                     yield sse.done()
@@ -413,6 +431,7 @@ async def _stream_response(prepared: PreparedRun, lock: Optional[asyncio.Lock]):
             return
 
         await _persist_session(prepared, paused=False, final_content="".join(content_parts))
+        _record_run(prepared)
         yield sse.final_chunk(model, chunk_id)
         yield sse.done()
     finally:

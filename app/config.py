@@ -115,20 +115,23 @@ class Settings(BaseSettings):
 settings = Settings()
 
 
-def reload_settings() -> Settings:
+def reload_settings(env_file: str = ".env") -> Settings:
     """Recarga la configuración desde el ``.env`` YA actualizado y la
     propaga al objeto `settings` existente (mutación campo a campo) para
     que las referencias ya importadas (`from .config import settings`)
     vean los cambios sin reiniciar.
+
+    ``env_file`` permite apuntar a otro fichero (la UI lo usa para poder
+    testearse contra un ``.env`` temporal); vacío = no leer ningún fichero.
 
     Se valida de nuevo con pydantic: si el ``.env`` nuevo no parsea, el
     objeto live se conserva intacto y se propaga el error (el caller
     revierte el backup y responde 500). No deja nunca al proceso con una
     configuración a medias.
     """
-    new = Settings()
+    new = Settings(_env_file=env_file or None)
     live = settings
-    for name in new.model_fields:
+    for name in type(new).model_fields:
         setattr(live, name, getattr(new, name))
     return live
 

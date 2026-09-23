@@ -29,11 +29,9 @@ garantiza estructura y atomicidad del fichero.
 """
 from __future__ import annotations
 
-import json
 import os
 import re
 import shutil
-import tempfile
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -254,7 +252,7 @@ def _atomic_write(file_path: Path, text: str) -> None:
         raise RuntimeError(f"no se pudo aplicar el .env: {exc}") from exc
 
 
-def write_env(path, updates: Dict[str, str]) -> None:
+def write_env(path, updates: Dict[str, str]) -> Optional[Path]:
     """Reescribe SOLO las claves enviadas en ``updates``.
 
     Reglas (docs/UI_IMPLEMENTACION.md §7, Paso 3):
@@ -265,6 +263,10 @@ def write_env(path, updates: Dict[str, str]) -> None:
          se añade dentro de la sección de su grupo (o al final con su propia
          cabecera si ese grupo todavía no tiene sección).
       3. escritura atómica (tmp + fsync + os.replace).
+
+    Devuelve la ruta del backup creado (``None`` si el fichero no existía,
+    es decir si no hubo nada que respaldar) para que el caller pueda revertir
+    exactamente ese estado si la recarga de la configuración falla.
     """
     # Validar estructura ANTES de tocar el disco.
     for key, value in updates.items():
@@ -278,8 +280,9 @@ def write_env(path, updates: Dict[str, str]) -> None:
     file_path = Path(path)
     if not file_path.exists():
         lines: List[str] = []
+        backup: Optional[Path] = None
     else:
-        _backup(file_path)  # EnvFileError si falla → nada se escribe
+        backup = _backup(file_path)  # EnvFileError si falla → nada se escribe
         lines = file_path.read_text(encoding="utf-8").splitlines()
 
     # Aplicar actualizaciones sobre las líneas existentes.
@@ -309,6 +312,25 @@ def write_env(path, updates: Dict[str, str]) -> None:
         _append_missing_keys(out, default_catalog, {k: updates[k] for k in missing})
 
     _atomic_write(file_path, "\n".join(out))
+    return backup
+
+
+def restore(path, text: Optional[str]) -> None:
+    """Devuelve el ``.env`` a un contenido previo exacto (``None`` = borrarlo).
+
+    Lo usa ``routes.py`` para revertir un PUT cuya configuración resultó no
+    parsear: no es una edición nueva, es un rollback, así que **no crea
+    backup** ni toca la rotación (el backup del intento fallido se queda,
+    como cualquier otro, sujeto al máximo de 10).
+    """
+    file_path = Path(path)
+    if text is None:
+        if file_path.exists():
+            file_path.unlink()
+        return
+    _atomic_write(file_path, text)
+
+
 def reset_fields(path, keys: List[str], catalog=None) -> None:
     """Escribe el default del catálogo para cada clave pedida.
 

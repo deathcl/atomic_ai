@@ -191,6 +191,23 @@ class SessionStore:
         for sid in expired:
             self._sessions.pop(sid, None)
 
+    # --- Lectura/borrado para la UI de administración (docs/UI_IMPLEMENTACION.md §6) ---
+
+    def snapshot(self) -> list[SessionState]:
+        """Sesiones vivas ordenadas por último uso (las más recientes primero).
+
+        Pensado para el panel de la UI: no modifica nada salvo descartar las
+        expiradas, así que una lectura del dashboard no altera el estado
+        observable por el proxy.
+        """
+        self._evict_expired_locked()
+        return sorted(self._sessions.values(), key=lambda s: s.last_used_at, reverse=True)
+
+    async def delete(self, session_id: str) -> bool:
+        """Elimina una sesión; ``True`` si existía."""
+        async with self._lock:
+            return self._sessions.pop(session_id, None) is not None
+
 
 class SqliteSessionStore(SessionStore):
     """SessionStore persistente en SQLite: sobrevive a reinicios del proceso
@@ -244,3 +261,10 @@ class SqliteSessionStore(SessionStore):
             (session.session_id, session.checkpoint_len, session.last_used_at, payload),
         )
         self._connection.commit()
+
+    async def delete(self, session_id: str) -> bool:
+        """Borra la sesión de memoria Y de SQLite (el panel debe mandar aquí)."""
+        removed = await super().delete(session_id)
+        self._connection.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+        self._connection.commit()
+        return removed

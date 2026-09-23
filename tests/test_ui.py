@@ -6,8 +6,9 @@ import pytest
 from pydantic import ValidationError
 from pydantic.fields import FieldInfo
 
-from app.config import Settings
-from app.web import catalog, envfile
+from app.config import Settings, settings
+from app.web import catalog, envfile, routes
+from app.web.registry import registry
 from app.web.schemas import ConfigUpdate, env_updates
 
 
@@ -228,4 +229,191 @@ def test_reset_fields_writes_defaults_and_clears_none(tmp_path):
     assert "EXPOSE_REASONING_CONTENT" not in data
     with pytest.raises(KeyError):
         envfile.reset_fields(p, ["NO_EXISTE"])
+
+
+# --- Paso 4: API de la UI (app/web/routes.py, §6) ---------------------------
+
+@pytest.fixture
+def ui_env(tmp_path, monkeypatch):
+    """Apunta la API a un `.env` temporal: los tests nunca tocan el real."""
+    path = tmp_path / ".env"
+    path.write_text(_SAMPLE, encoding="utf-8")
+    monkeypatch.setattr(routes, "ENV_PATH", path)
+    registry.reset()
+    return path
+
+
+async def test_ui_catalog_endpoint_exposes_catalog_without_hardcoding(client, ui_env):
+    resp = await client.get("/ui/api/catalog")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["groups"] == list(catalog.GROUPS)
+    params = {p["field"]: p for p in body["params"]}
+    assert set(params) == set(Settings.model_fields)
+    assert all(p["widget"] in catalog.WIDGETS for p in body["params"])
+    # los select llegan con sus opciones CERRADAS: el JS no puede inventarlas
+    profile = params["atomic_profile"]
+    assert profile["widget"] == "select"
+    assert profile["options"] == ["fast", "balanced", "quality"]
+
+
+async def test_get_config_groups_every_param_and_masks_secrets(client, ui_env, monkeypatch):
+    monkeypatch.setattr(settings, "upstream_api_key", "sk-super-secreta-1234")
+    resp = await client.get("/ui/api/config")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert [group["name"] for group in body["groups"]] == list(catalog.GROUPS)
+
+    fields = [field for group in body["groups"] for field in group["fields"]]
+    assert len(fields) == len(catalog.PARAMS)
+
+    secret = next(f for f in fields if f["field"] == "upstream_api_key")
+    assert secret["value"] == "\u2022\u2022\u2022\u20221234"
+    assert "sk-super-secreta-1234" not in resp.text      # jamás en claro
+
+    model = next(f for f in fields if f["field"] == "upstream_model")
+    assert model["value"] == settings.upstream_model
+    assert model["is_set"] is True                       # está en el .env de prueba
+
+
+async def test_put_config_writes_env_reloads_and_backs_up(client, ui_env):
+    resp = await client.put(
+        "/ui/api/config", json={"atomic_profile": "fast", "trace_mode": "full"}
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["applied"] is True
+    assert body["changed"] == ["ATOMIC_PROFILE", "TRACE_MODE"]
+
+    text = ui_env.read_text(encoding="utf-8")
+    assert "ATOMIC_PROFILE=fast" in text
+    assert "TRACE_MODE=full" in text
+    # recarga en caliente: el proceso ve la config nueva sin reiniciar
+    assert settings.atomic_profile == "fast"
+    assert settings.effective_trace_mode() == "full"
+
+    backups = list(ui_env.parent.glob(".env.bak-*"))
+    assert len(backups) == 1
+    assert "UPSTREAM_MODEL=model-x" in backups[0].read_text(encoding="utf-8")
+
+
+async def test_put_invalid_value_leaves_env_byte_identical(client, ui_env):
+    before = ui_env.read_bytes()
+    resp = await client.put("/ui/api/config", json={"atomic_profile": "turbo"})
+    assert resp.status_code == 422
+    assert ui_env.read_bytes() == before
+    assert not list(ui_env.parent.glob(".env.bak-*"))   # no se llegó a escribir
+
+
+async def test_put_secrets_are_write_only_and_empty_keeps_current(client, ui_env):
+    before = ui_env.read_bytes()
+
+    masked = await client.put(
+        "/ui/api/config", json={"upstream_api_key": "\u2022\u2022\u2022\u20221234"}
+    )
+    assert masked.status_code == 200
+    assert masked.json()["applied"] is False       # la máscara no reescribe nada
+    assert ui_env.read_bytes() == before
+
+    empty = await client.put("/ui/api/config", json={"upstream_api_key": ""})
+    assert empty.json()["applied"] is False        # vacío = conservar la actual
+    assert ui_env.read_bytes() == before
+
+    real = await client.put("/ui/api/config", json={"upstream_api_key": "sk-nueva-9999"})
+    assert real.json()["applied"] is True
+    assert "UPSTREAM_API_KEY=sk-nueva-9999" in ui_env.read_text(encoding="utf-8")
+    assert settings.upstream_api_key == "sk-nueva-9999"
+
+
+async def test_reset_endpoint_restores_catalog_defaults(client, ui_env):
+    resp = await client.post(
+        "/ui/api/config/reset", json={"fields": ["LOG_LEVEL", "EXPOSE_REASONING_CONTENT"]}
+    )
+    assert resp.status_code == 200
+    data = envfile.read_env(ui_env)
+    assert data["LOG_LEVEL"] == "INFO"
+    assert "EXPOSE_REASONING_CONTENT" not in data   # default None → sin definir
+
+    unknown = await client.post("/ui/api/config/reset", json={"fields": ["NO_EXISTE"]})
+    assert unknown.status_code == 422
+
+
+async def test_token_required_when_set(client, ui_env, monkeypatch):
+    monkeypatch.setattr(settings, "ui_token", "t" * 16)
+
+    # leer no exige token (y no filtra secretos: solo máscaras)
+    assert (await client.get("/ui/api/config")).status_code == 200
+
+    assert (await client.put("/ui/api/config", json={"atomic_profile": "fast"})).status_code == 401
+    assert (await client.delete("/ui/api/sessions/x")).status_code == 401
+
+    authorized = await client.put(
+        "/ui/api/config", json={"atomic_profile": "fast"}, headers={"X-UI-Token": "t" * 16}
+    )
+    assert authorized.status_code == 200
+
+
+async def test_sessions_endpoints(client, ui_env):
+    listing = await client.get("/ui/api/sessions")
+    assert listing.status_code == 200
+    body = listing.json()
+    assert body["active"] == 0
+    assert body["sessions"] == []
+    assert body["backend"] == settings.session_backend
+    assert (await client.delete("/ui/api/sessions/no-existe")).status_code == 404
+
+
+async def test_stats_endpoint_aggregates_registry(client, ui_env):
+    registry.record(
+        {
+            "upstream_calls": 3,
+            "retries": 1,
+            "tool_calls": 0,
+            "subtasks": 2,
+            "usage": {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150},
+            "cost_usd": 0.25,
+            "duration_seconds": 2.0,
+            "limits_hit": ["max_total_tasks"],
+            "phases": {"executor": {"calls": 3, "retries": 1}},
+            "errors": [],
+        }
+    )
+    body = (await client.get("/ui/api/stats")).json()
+    assert body["totals"]["runs"] == 1
+    assert body["totals"]["upstream_calls"] == 3
+    assert body["totals"]["total_tokens"] == 150
+    assert body["totals"]["cost_usd"] == 0.25
+    assert body["by_phase"]["executor"] == {"calls": 3, "retries": 1}
+    assert body["limits_hit"] == {"max_total_tasks": 1}
+    assert body["config"]["model"] == settings.upstream_model
+    assert len(body["recent"]) == 1
+
+
+async def test_stats_stream_emits_named_event(ui_env):
+    stream = routes.stats_events(interval=0.01)
+    try:
+        first = await anext(stream)
+    finally:
+        await stream.aclose()
+    assert first.startswith("event: stats\ndata: {")
+    assert '"totals"' in first
+
+
+async def test_playground_streams_real_engine_events(client, ui_env, fake_upstream):
+    fake_upstream.queue_completion(content='{"atomic": true, "subtasks": []}')
+    fake_upstream.queue_stream(pieces=["hola desde el playground"])
+
+    resp = await client.post(
+        "/ui/api/playground",
+        json={"messages": [{"role": "user", "content": "di hola"}], "profile": "fast"},
+    )
+    assert resp.status_code == 200
+    body = resp.text
+    assert "event: chunk" in body
+    assert "event: content" in body
+    assert "hola desde el playground" in body
+    assert "event: metrics" in body
+    assert body.rstrip().endswith("data: [DONE]")
+
+
 

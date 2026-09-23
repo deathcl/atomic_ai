@@ -130,7 +130,7 @@ También admite el formato clásico de strings (`"subtasks": ["haz X", "haz Y"]`
 
 **Qué hace.** Evita inflar los prompts con el history completo: limita cuántos caracteres de resultados anteriores viajan en `<trabajo_previo>` (recortando los más antiguos primero) y pone un tope al contexto acumulado de la fase de ejecución.
 
-**Dónde vive.** `app/context.py` (`render_results()`), con los topes que aplica `app/budget.py`.
+**Dónde vive.** `app/context.py` (`condense_result()` para el recorte de un resultado concreto y `render_results()` como utilidad de unión con presupuesto), aplicado por `app/engine.py` en `_render_previous_results()` (`<trabajo_previo>` de cada hoja) y por los topes de `app/budget.py`.
 
 | Variable | Default | Significado |
 |----------|---------|-------------|
@@ -176,6 +176,8 @@ Request con `[{"type":"text","text":"describe este pantallazo"}, {"type":"image_
 
 **Dónde vive.** `app/profiles.py` (`PROFILES`, `normalize_profile`), `app/runtime.py` (`resolve_runtime` aplica el perfil y lo serializa en la sesión), `app/engine.py` (`_recompute_fast_path()`).
 
+**Corrección (v1.1.1).** El fast path entregaba la respuesta **vacía**: la hoja atómica se ejecutaba con `emit_content=False` (correcto en el flujo normal, donde el cliente solo ve la síntesis) y, al no haber síntesis, no quedaba ningún evento `content` que enviar. Ahora `_leaf_events` usa `emit_content=self.fast_path_active`, de modo que la salida de la hoja solo se streamea al cliente cuando esa hoja *es* la respuesta final. Cubierto por `tests/test_e2e.py::test_fast_path_returns_leaf_content_to_the_client`.
+
 **Ejemplo.** Una petición puntual de máxima calidad sin editar configuración:
 ```bash
 curl http://127.0.0.1:8000/v1/chat/completions \
@@ -188,7 +190,7 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 **Qué hace.**
 
 - **Verificación** (`ENABLE_VERIFICATION=true`): después de la síntesis, una fase extra (modelo `VERIFICATION_MODEL` o el de síntesis) revisa la respuesta contra el objetivo con salida JSON (`{"ok": …, "revised": …}`). Si `ok=false`, sustituye la respuesta por `revised` y vuelve a verificar, hasta `VERIFICATION_MAX_REVISIONS` correcciones. Si la verificación es ilegible, se registra el error y se entrega la respuesta tal cual (nunca se pierde un run por esto).
-- **Paralelismo** (`ENABLE_PARALLEL_TASKS=true`): si la descomposición declaró dependencias (`depends_on`), las hojas se ejecutan en orden topológico (Kahn) en oleadas de hasta `MAX_PARALLEL_TASKS` en paralelo. Antes de paralelizar se comprueba con `has_side_effect_tools()` que las `tools` del cliente no tengan efectos secundarios (escrituras, envíos…): si los tienen, se mantiene el orden secuencial.
+- **Paralelismo** (`ENABLE_PARALLEL_TASKS=true`): si la descomposición declaró dependencias (`depends_on`), las hojas se ejecutan en orden topológico (Kahn) en oleadas de hasta `MAX_PARALLEL_TASKS` en paralelo. Antes de paralelizar se comprueba con `has_side_effect_tools()` que las `tools` del cliente no tengan efectos secundarios (escrituras, envíos…): si los tienen, se mantiene el orden secuencial. Esa decisión vive en `AtomicDecompositionEngine._parallel_ready()` y se registra como evento `parallel_tasks_disabled` (nivel `WARNING`, con los nombres de las tools de riesgo) cuando se degrada a secuencial. Cubierto por `tests/test_engine.py::test_parallel_requires_dependencies_and_side_effect_free_tools`.
 
 **Dónde vive.** `app/engine.py` — `_verify_and_maybe_revise()`, `_execution_order()`, `_run_parallel_wave()`; `app/tools.py` — `has_side_effect_tools()`.
 
@@ -266,7 +268,7 @@ El cliente recibe `tool_calls`, el operador reinicia el proceso y, al volver la 
 
 ## 13. Pruebas, CI y documentación
 
-**Qué hay.** 40 tests (`pytest` + `pytest-asyncio`) cubriendo presupuesto, reintentos, métricas/coste, perfiles, múltiples modelos, imágenes por fase, paralelismo, verificación, fast path y reanudación, con un `FakeUpstream` que registra cada payload recibido. CI en GitHub Actions (`.github/workflows/tests.yml`) que ejecuta la suite en cada push/PR sobre varias versiones de Python. La documentación vive en `README.md`, `.env.example` y `docs/`.
+**Qué hay.** 69 tests (`pytest` + `pytest-asyncio`) cubriendo presupuesto, reintentos, métricas/coste, perfiles, múltiples modelos, imágenes por fase, paralelismo (incluida la degradación a secuencial con tools de riesgo), verificación, fast path y reanudación, más la API de la UI (`tests/test_ui.py`), con un `FakeUpstream` que registra cada payload recibido. CI en GitHub Actions (`.github/workflows/tests.yml`) que ejecuta la suite en cada push/PR sobre varias versiones de Python. La documentación vive en `README.md`, `.env.example` y `docs/`.
 
 ---
 
