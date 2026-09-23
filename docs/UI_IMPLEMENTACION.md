@@ -201,6 +201,14 @@ class ParamSpec:
 | `EXPOSE_METRICS` | `toggle` | on/off | no |
 | `MODEL_PRICES` | `json` | JSON de `Dict[str, Dict[str, float]]`, claves de precio solo `input`/`output`/`prompt`/`completion`, valores ≥ 0 (validación Pydantic, ver §5.3) | no |
 
+**Grupo: UI**
+
+| env | widget | validación | secret | restart |
+|-----|--------|-----------|--------|---------|
+| `UI_TOKEN` | `password` | `\A[A-Za-z0-9_\-]{16,128}\Z` o vacío (= sin autenticación, solo aceptable en `127.0.0.1`) | **sí** | no |
+
+`UI_TOKEN` protege las rutas de escritura de `/ui/api` (header `X-UI-Token`). Es editable desde la propia UI, pero **cada escritura exige el token vigente** mientras haya uno definido: no se puede reconfigurar la UI sin conocerlo (y siempre se puede corregir a mano en el `.env`).
+
 ## 5. Reglas de validación (los campos que sí se escriben a mano)
 
 Los únicos widgets de escritura libre son `text`, `password`, `url`, `path` y `json`. Todos validan **en dos capas**: patrón/`min`/`max` en el navegador (feedback inmediato) y **modelo Pydantic en el servidor** (`app/web/schemas.py`), que es el que manda. Un `PUT` inválido devuelve `422` con el detalle de campo y **no toca el `.env`**.
@@ -212,6 +220,7 @@ MODEL_RE   = r"^[a-zA-Z0-9][a-zA-Z0-9._\-:/]{0,119}$"      # modelos: gpt-4o, de
 URL_RE     = r"^https?://[^\s]+$"                            # http(s) sin espacios
 SECRET_RE  = r"^\S*$"                                        # keys: una línea, sin espacios
 PATH_RE    = r"^\.{0,2}/?[^\*\?\"<>\|]{1,299}(\.(db|sqlite))?$"  # rutas de sesión
+KEY_RE     = r"^[A-Za-z0-9_\-]{16,128}$"                      # UI_TOKEN (§7, Paso 7)
 ```
 
 Reglas comunes:
@@ -274,7 +283,8 @@ Ejemplo válido: `{"deepseek-v4-flash": {"input": 0.5, "output": 2.0}}`. Inváli
 | `GET` | `/ui/api/sessions` | Lista de sesiones del store (id, estado, fase pausa, edad) | — |
 | `DELETE` | `/ui/api/sessions/{id}` | Elimina una sesión | `404` |
 
-**Seguridad transversal:** todas las rutas de `PUT/DELETE/POST` exigen header `X-UI-Token` si `settings.ui_token` está definido (opcional, default vacío = desactivado porque ya estamos en `127.0.0.1`). Añadir al catálogo futuro: `UI_TOKEN` (widget `password`, secret).
+**Seguridad transversal:** todas las rutas de `PUT/DELETE/POST` exigen header `X-UI-Token` si `settings.ui_token` está definido (`401` si falta o no coincide, comparación con `secrets.compare_digest`). `UI_TOKEN` está catalogado (widget `password`, secret, `KEY_RE`): vacío = desactivado, aceptable porque el proxy escucha en `127.0.0.1` por defecto.
+
 
 ## 7. Fase 1 — implementación paso a paso
 
@@ -383,7 +393,10 @@ Y extraer a `app/streaming.py` (si no estaba ya): `format_sse(event, ...)` y el 
 
 ### Paso 7 — configuración de la propia UI (catálogo)
 
-Añadir a `catalog.PARAMS` y `Settings`: `UI_TOKEN` (widget `key`, secret, patrón `^[A-Za-z0-9_\-]{16,128}$`, opcional). Mientras el proxy escucha en `127.0.0.1` puede quedar vacío; **es obligatorio** si algún día se expone en red (así lo indica su `description`).
+Añadido a `catalog.PARAMS` y `Settings`: `UI_TOKEN` (widget `password`, secret, patrón `KEY_RE` = `\A[A-Za-z0-9_\-]{16,128}\Z`, opcional; grupo `UI` en `GROUPS`). Mientras el proxy escucha en `127.0.0.1` puede quedar vacío; **es obligatorio** si algún día se expone en red (así lo indica su `description`). La sección `UI` del `.env.example` ya existe, de modo que una clave ausente se inserta en su sitio (este token se escribe a mano en el `.env` del mismo modo que el resto).
+
+Pendiente de este paso: `test_token_required_when_set` (depende del Paso 4, que es quien exige el header).
+
 
 ### Paso 8 — tests (`tests/test_ui.py`)
 
@@ -420,7 +433,7 @@ Cada punto de Fase 2 sigue las mismas reglas: catálogo único, widgets generado
 
 > **Si este documento quedó a medias, esta sección es tu punto de reanudación.** Marca lo que esté hecho; todo lo no marcado es lo siguiente. Regla de oro: **nada nuevo sin `pytest` en verde** y **nada de la UI escrito a mano que deba salir del catálogo**.
 
-**Estado actual al escribir este documento: pasos 1–3 implementados y en verde (55/55 tests). Índice de progreso = Pasos 1–9 de §7 + Fase 2.
+**Estado actual: pasos 1–3 implementados y en verde (56/56 tests), más `UI_TOKEN` (Paso 7) ya presente en `Settings`, en el catálogo y en el `.env.example`; del Paso 7 solo falta el test, que depende del Paso 4.** Índice de progreso = Pasos 1–9 de §7 + Fase 2.
 
 - [x] **Paso 1** — `app/web/catalog.py` existe; `PARAMS` cubre exactamente `Settings.model_fields`; test `test_catalog_matches_settings` en verde.
 - [x] **Paso 2** — `app/web/schemas.py` genera `ConfigUpdate` desde el catálogo; test `test_config_update_*` (Literal, límites, patrones, secrets, modelo precios) en verde.
@@ -428,7 +441,7 @@ Cada punto de Fase 2 sigue las mismas reglas: catálogo único, widgets generado
 - [ ] **Paso 4** — `app/web/routes.py` con los 9 endpoints de §6 montados en `main.py`; `PUT` recarga en caliente y revierte ante config inválida.
 - [ ] **Paso 5** — `static/index.html` + `app.js` + `styles.css`; **verificación manual**: abrir `/ui/`, cambiar `ATOMIC_PROFILE` en el desplegable y comprobar que no existe ningún campo de texto libre donde el catálogo dice `select`/`toggle`/`slider`.
 - [ ] **Paso 6** — SSE compartido extraído a `app/streaming.py`; `/v1/chat/completions` sigue pasando sus tests (nada roto).
-- [ ] **Paso 7** — `UI_TOKEN` en `Settings` + catálogo + `.env.example`; test `test_token_required_when_set` en verde.
+- [ ] **Paso 7** — `UI_TOKEN` en `Settings` + catálogo + `.env.example` (**hecho**); falta `test_token_required_when_set`, que se escribe con el Paso 4 (es el que exige el header).
 - [ ] **Paso 8** — los 10 tests de la tabla en verde (`tests/test_ui.py`).
 - [ ] **Paso 9** — README, `GUIA_DEL_PROXY.md` y `.env.example` actualizados.
 - [ ] **Fase 2** — §8, uno a uno (sesiones → perfil → test de conexión → log → histórico).

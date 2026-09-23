@@ -86,6 +86,14 @@ class Settings(BaseSettings):
     model_prices: Dict[str, Dict[str, float]] = {}
     log_level: str = "INFO"
 
+    # --- UI (V2.0) ---
+    # Secreto de autorización de la UI admin (header X-UI-Token). Si está
+    # vacío no se exige (el proxy por defecto escucha en 127.0.0.1);
+    # obligatorio si se expone en red. Editable desde la propia UI, pero
+    # cada escritura exige el token VIGENTE (si ya hay uno definido), de
+    # modo que no se puede reconfigurar la UI sin conocerlo.
+    ui_token: str = ""
+
     # --- Persistencia de sesiones (V1.3) ---
     session_backend: Literal["memory", "sqlite"] = "memory"
     session_database_path: str = "./data/sessions.db"
@@ -105,4 +113,22 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+def reload_settings() -> Settings:
+    """Recarga la configuración desde el ``.env`` YA actualizado y la
+    propaga al objeto `settings` existente (mutación campo a campo) para
+    que las referencias ya importadas (`from .config import settings`)
+    vean los cambios sin reiniciar.
+
+    Se valida de nuevo con pydantic: si el ``.env`` nuevo no parsea, el
+    objeto live se conserva intacto y se propaga el error (el caller
+    revierte el backup y responde 500). No deja nunca al proceso con una
+    configuración a medias.
+    """
+    new = Settings()
+    live = settings
+    for name in new.model_fields:
+        setattr(live, name, getattr(new, name))
+    return live
 

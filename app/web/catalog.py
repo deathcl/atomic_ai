@@ -39,6 +39,9 @@ SECRET_RE = r"\A\S*\Z"                                   # keys: una sola línea
 # §4.1: relativo (./…) o absoluto, SIN "..", terminado en .db/.sqlite,
 # sin caracteres comodines de shell ni saltos de línea.
 PATH_RE = r"\A(?!\.\.)(?:\./|/)?[^*?\"<>|\r\n]{1,297}\.(?:db|sqlite)\Z"
+# §7 Paso 7: token de la UI admin. Vacío = sin autenticación (solo aceptable
+# escuchando en 127.0.0.1); si se define, 16-128 chars de [A-Za-z0-9_-].
+KEY_RE = r"\A[A-Za-z0-9_\-]{16,128}\Z"
 
 WIDGETS: Tuple[str, ...] = (
     "select", "toggle", "int", "float", "text", "password", "url", "path", "json",
@@ -56,6 +59,7 @@ GROUPS: Tuple[str, ...] = (  # orden de las pestañas del formulario (§4.1)
     "Sesiones",
     "Multimodal",
     "Observabilidad",
+    "UI",
 )
 
 PARAMS: Tuple[ParamSpec, ...] = (
@@ -399,5 +403,13 @@ PARAMS: Tuple[ParamSpec, ...] = (
         label="Precios por modelo",
         description='JSON {"modelo": {"input": USD/Mtok, "output": USD/Mtok}} para el coste estimado. Claves admitidas: input/output/prompt/completion.',
         widget="json", default={},
+    ),
+    # --- Grupo: UI (§7, Paso 7) ---
+    ParamSpec(
+        key="UI_TOKEN", field="ui_token", group="UI",
+        label="Token de la UI admin",
+        description="Secreto que protege /ui/api (header X-UI-Token). Vacío = sin autenticación: solo aceptable si el proxy escucha en 127.0.0.1; obligatorio si se expone en red. 16-128 caracteres.",
+        widget="password", default="", pattern=KEY_RE, max_length=128, secret=True,
+        placeholder="vacío = sin autenticación (solo en 127.0.0.1)",
     ),
 )

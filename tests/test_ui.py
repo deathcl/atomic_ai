@@ -68,9 +68,23 @@ def test_secrets_and_json_widget():
         "executor_api_key",
         "synthesis_api_key",
         "verification_api_key",
+        "ui_token",
     }
     prices = next(s for s in catalog.PARAMS if s.field == "model_prices")
     assert prices.widget == "json"
+
+
+def test_ui_token_pattern_is_enforced():
+    """UI_TOKEN: vacío permitido (sin auth); definido exige 16-128 chars."""
+    assert ConfigUpdate(ui_token="").ui_token == ""
+    long_token = "a" * 16
+    assert ConfigUpdate(ui_token=long_token).ui_token == long_token
+    with pytest.raises(ValidationError):
+        ConfigUpdate(ui_token="corto")          # < 16
+    with pytest.raises(ValidationError):
+        ConfigUpdate(ui_token="a" * 129)        # > 128
+    with pytest.raises(ValidationError):
+        ConfigUpdate(ui_token="a" * 15 + "!")   # carácter fuera de [A-Za-z0-9_-]
 
 
 # --- Paso 2: ConfigUpdate generado del catálogo -----------------------------
