@@ -113,3 +113,24 @@ async def test_tool_call_round_trip_through_http_does_not_redecompose(client, fa
 
     decomposition_calls = [r for r in fake_upstream.received if r.get("response_format")]
     assert len(decomposition_calls) == 1
+
+
+async def test_fast_path_returns_leaf_content_to_the_client(client, fake_upstream):
+    """Fast path: la hoja atómica debe llegar al cliente como respuesta final.
+
+    Regresión: el motor ejecutaba la hoja con emit_content=False, así que con
+    ATOMIC_FAST_PATH=true (o X-Atomic-Profile: fast) el cliente recibía una
+    respuesta vacía (content=None) tras 2 llamadas al upstream.
+    """
+    fake_upstream.queue_completion(content='{"atomic": true, "subtasks": []}')
+    fake_upstream.queue_stream(pieces=["respuesta atómica"])
+
+    resp = await client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "di algo"}]},
+        headers={"X-Atomic-Profile": "fast"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["choices"][0]["message"]["content"] == "respuesta atómica"
+    assert len(fake_upstream.received) == 2      # descomposición + ejecución, sin síntesis
+

@@ -216,3 +216,35 @@ async def test_images_are_attached_to_every_phase(fake_upstream):
         user_content = fake_upstream.received[i]["messages"][1]["content"]
         assert isinstance(user_content, list)
         assert image_part in user_content
+
+
+async def test_parallel_requires_dependencies_and_side_effect_free_tools():
+    """§9: el paralelismo se desactiva con tools de efectos secundarios."""
+    from app.runtime import resolve_runtime
+
+    config = resolve_runtime("test-model")
+    config.enable_parallel_tasks = True
+
+    safe = _engine(
+        tools=[{"type": "function", "function": {"name": "leer_archivo"}}], config=config
+    )
+    safe._deps_declared = True
+    assert safe._parallel_ready() == (True, [])
+
+    risky = _engine(
+        tools=[{"type": "function", "function": {"name": "escribir_archivo"}}], config=config
+    )
+    risky._deps_declared = True
+    allowed, names = risky._parallel_ready()
+    assert allowed is False
+    assert names == ["escribir_archivo"]
+
+    # Sin dependencias declaradas no hay oleadas que calcular.
+    safe._deps_declared = False
+    assert safe._parallel_ready() == (False, [])
+
+    # Y con el flag apagado, tampoco.
+    safe._deps_declared = True
+    config.enable_parallel_tasks = False
+    assert safe._parallel_ready() == (False, [])
+

@@ -28,13 +28,12 @@ from . import prompts
 from .budget import ExecutionBudget
 from .config import settings
 from .content import build_multimodal_content
-from .context import render_results
 from .decomposition import DecompositionError, load_json_object, parse_decomposition
 from .observability import RunMetrics, log
 from .params import GenerationParams
 from .runtime import PhaseConfig, RuntimeConfig
 from .tools import has_side_effect_tools
-from .upstream import UpstreamClient, UpstreamError
+from .upstream import UpstreamClient
 
 Event = tuple[str, Any]
 Phase = Literal["leaf", "synthesis"]
@@ -795,8 +794,16 @@ class AtomicDecompositionEngine:
             return
 
     async def _leaf_events(self, index: int, seed: List[Dict[str, Any]]) -> AsyncIterator[Event]:
+        # emit_content=self.fast_path_active: la salida de la hoja se streamea al
+        # cliente SOLO cuando esa hoja ES la respuesta final (fast path de una
+        # única tarea atómica). En el flujo normal el cliente ve la síntesis, no
+        # el trabajo interno de cada hoja; sin esta condición, el fast path
+        # terminaba sin emitir contenido y el cliente recibía una respuesta vacía.
         async for kind, payload in self._run_phase(
-            seed_messages=seed, phase="executor", leaf_index=index, emit_content=False
+            seed_messages=seed,
+            phase="executor",
+            leaf_index=index,
+            emit_content=self.fast_path_active,
         ):
             if kind == PENDING:
                 yield ("tool_calls", payload["tool_calls"])
@@ -855,11 +862,38 @@ class AtomicDecompositionEngine:
         finally:
             self.metrics.record_duration("executor", time.perf_counter() - started)
 
+    def _parallel_ready(self) -> Tuple[bool, List[str]]:
+        """¿Se puede paralelizar la Fase 2? → ``(permitido, tools de riesgo)``.
+
+        Requisitos (docs/MEJORAS_IMPLEMENTADAS.md §9):
+
+        1. ``ENABLE_PARALLEL_TASKS=true``;
+        2. la descomposición declaró dependencias: sin ellas no hay oleadas que
+           calcular y el orden natural ya es el correcto;
+        3. las ``tools`` del cliente **no** tienen efectos secundarios
+           (``has_side_effect_tools``): dos escrituras o envíos concurrentes
+           pueden pisarse entre sí, así que en ese caso se mantiene el orden
+           secuencial.
+        """
+        if not self.config.enable_parallel_tasks or not self._deps_declared:
+            return False, []
+        risky, names = has_side_effect_tools(self._tools or [])
+        if risky:
+            return False, names
+        return True, []
+
     async def execute_tree(self) -> AsyncIterator[Event]:
-        """Fase 2: ejecuta todas las hojas atómicas en orden (topológico si
-        hay dependencias declaradas y paralelización activada)."""
+        """Fase 2: ejecuta todas las hojas atómicas en orden (topológico si hay
+        dependencias declaradas y paralelizar es seguro)."""
         order = self._execution_order()
-        parallel = self.config.enable_parallel_tasks and self._deps_declared
+        parallel, risky_tools = self._parallel_ready()
+        if risky_tools:
+            log(
+                "parallel_tasks_disabled",
+                level=30,
+                tools=risky_tools,
+                reason="tools_with_side_effects",
+            )
         if not parallel:
             for index in order:
                 async for event in self._execute_leaf_step(index):
